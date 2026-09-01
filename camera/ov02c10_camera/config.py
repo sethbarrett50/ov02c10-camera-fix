@@ -13,6 +13,15 @@ class CameraConfig:
         sensor_width: Native sensor width in pixels including padding.
         sensor_height: Native sensor height in pixels.
         sensor_format: Media bus format string for IPU6 link configuration.
+            This is a hardware-negotiation label for the CSI2 receiver —
+            'SGRBG10_1X10' is what this hardware/driver actually validates
+            (matches what libcamera/cam always uses) and, per a direct
+            per-quad-position channel-mean comparison on a real capture,
+            also matches the sensor's true physical Bayer order (GRBG
+            indexing in camera.py._debayer()). Changing this string to
+            'SRGGB10_1X10' broke VIDIOC_STREAMON entirely — it's a hardware
+            negotiation value, not a free software-side relabeling.
+            See docs/DEBUGGING.md.
         output_width: Display/loopback output width after downscaling.
         output_height: Display/loopback output height after downscaling.
         framerate: Target output framerate.

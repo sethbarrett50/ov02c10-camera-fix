@@ -10,10 +10,11 @@ import select
 import numpy as np
 
 from .config import CameraConfig
-from .media_pipeline import set_sensor_gain, setup_media_pipeline
+from .media_pipeline import find_sensor_entity, run_cmd, set_sensor_gain, setup_media_pipeline
 from .v4l2_types import (
     V4L2_BUF_TYPE_VIDEO_CAPTURE,
     V4L2_MEMORY_MMAP,
+    V4L2_PIX_FMT_SGRBG10,
     VIDIOC_DQBUF,
     VIDIOC_QBUF,
     VIDIOC_QUERYBUF,
@@ -21,7 +22,6 @@ from .v4l2_types import (
     VIDIOC_S_FMT,
     VIDIOC_STREAMOFF,
     VIDIOC_STREAMON,
-    V4L2_PIX_FMT_pgAA,
     V4L2Buffer,
     V4L2Format,
     V4L2RequestBuffers,
@@ -34,7 +34,7 @@ class V4L2Camera:
     """V4L2 mmap camera interface for the OV02C10 sensor.
 
     Handles device open/close, buffer allocation, streaming, and per-frame
-    pgAA unpacking and software debayering.
+    raw-buffer unpacking and software debayering.
     """
 
     def __init__(self, cfg: CameraConfig) -> None:
@@ -79,28 +79,135 @@ class V4L2Camera:
         self._out_buf = bytearray(oh * ow * 4)
         self._out_view = np.frombuffer(self._out_buf, dtype=np.uint8).reshape(oh, ow, 4)
 
-    def open(self) -> None:
-        """Open the capture device, allocate mmap buffers, and start streaming.
+        # 6-bit fixed-point white-balance gains (>>6 = /64), 64 = identity.
+        # Calibrated from the first real frame of each session in
+        # _calibrate_white_balance() rather than hardcoded — a fixed
+        # constant tuned for one lighting snapshot missed badly once room
+        # lighting changed between test runs (raw frame mean moved from
+        # ~437 to ~915 out of 1023 between two captures minutes apart).
+        # See docs/DEBUGGING.md and #3 (real per-frame auto-gain is a
+        # further step beyond this one-shot-per-session calibration).
+        self._sr = np.uint16(64)
+        self._sg = np.uint16(64)
+        self._sb = np.uint16(64)
+        self._wb_calibrated = False
 
-        Also re-runs media pipeline configuration with the device fd held open,
-        which is required because the IPU6 resets link state when the fd closes.
+    def _calibrate_exposure(self, bayer8: np.ndarray) -> np.ndarray:
+        """Nudge hardware analogue_gain toward a target brightness, once per session.
+
+        cfg.analogue_gain was tuned for a dark room (see docs/DEBUGGING.md);
+        in brighter conditions it overexposes badly enough that channels
+        clip before white-balance correction can help — observed raw means
+        as high as 235/255 with the fixed gain, with the room's actual
+        brightness swinging more than 2x between test runs minutes apart.
+        This is a one-shot brightness check + gain adjustment from the
+        first real frame, not a continuous AE loop (see #3 for that). If
+        the frame is already in a reasonable range, no change is made.
+
+        Args:
+            bayer8: 2-D uint8 Bayer mosaic from the first real frame.
+
+        Returns:
+            A frame captured after the gain change settles, or the
+            original frame unchanged if no adjustment was needed.
+        """
+        b = bayer8[: self._h2, : self._w2]
+        brightness = float(b.mean())
+        target = 128.0
+        if 90.0 <= brightness <= 170.0:
+            log.info('Exposure OK at startup (brightness=%.1f/255), no gain adjustment', brightness)
+            return bayer8
+
+        ratio = target / max(brightness, 1.0)
+        new_gain = max(16, min(248, round(self.cfg.analogue_gain * ratio)))
+        log.info(
+            'Adjusting analogue_gain %d -> %d (brightness=%.1f/255, target=%.0f)',
+            self.cfg.analogue_gain,
+            new_gain,
+            brightness,
+            target,
+        )
+        sensor_entity = find_sensor_entity(self.cfg.media_device)
+        subdev = run_cmd(['media-ctl', '-d', self.cfg.media_device, '-e', sensor_entity]).stdout.strip()
+        run_cmd(['v4l2-ctl', '-d', subdev, '-c', f'analogue_gain={new_gain}'])
+
+        # Let the new exposure settle before using a frame for calibration.
+        raw = None
+        for _ in range(2):
+            r, _, _ = select.select([self.fd], [], [], 2.0)
+            if not r:
+                break
+            buf = V4L2Buffer()
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+            buf.memory = V4L2_MEMORY_MMAP
+            fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf)
+            self.buffers[buf.index].seek(0)
+            raw = np.frombuffer(self.buffers[buf.index].read(buf.bytesused), dtype=np.uint8)
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
+        return self._unpack_sgrbg10(raw) if raw is not None else bayer8
+
+    def _calibrate_white_balance(self, bayer8: np.ndarray) -> None:
+        """Derive gray-world white-balance gains from one real frame.
+
+        Computes the mean raw value at each Bayer quad position and scales
+        R/B gains to match G's mean, so a roughly neutral scene renders
+        without a color cast. Clamped to a modest range to avoid extreme
+        correction on a genuinely non-neutral scene. Runs once per stream
+        start (see read_frame()), not every frame — cheap, and avoids
+        gain hunting from frame-to-frame scene variation.
+
+        Args:
+            bayer8: 2-D uint8 Bayer mosaic to calibrate from.
+        """
+        b = bayer8[: self._h2, : self._w2].astype(np.float64)
+        r_mean = b[0::2, 1::2].mean()
+        g_mean = (b[0::2, 0::2].mean() + b[1::2, 1::2].mean()) / 2
+        b_mean = b[1::2, 0::2].mean()
+
+        def gain(target: float, source: float) -> np.uint16:
+            if source < 1:
+                return np.uint16(64)
+            ratio = min(max(target / source, 0.5), 3.0)
+            return np.uint16(round(ratio * 64))
+
+        self._sr = gain(g_mean, r_mean)
+        self._sb = gain(g_mean, b_mean)
+        self._wb_calibrated = True
+        log.info(
+            'White balance calibrated from R=%.1f G=%.1f B=%.1f: sr=%d sg=64 sb=%d (/64)',
+            r_mean,
+            g_mean,
+            b_mean,
+            self._sr,
+            self._sb,
+        )
+
+    def open(self) -> None:
+        """Open the capture device, configure the pipeline, and start streaming.
+
+        Media pipeline (links + subdev pad formats) is configured once here,
+        before REQBUFS/QBUF — reconfiguring it afterwards, with buffers
+        already queued for the old format, caused VIDIOC_STREAMON to fail
+        with BrokenPipeError on any run after the first (dmesg showed CSI2
+        "Frame sync error" / "Transfer FIFO overflow"). See docs/DEBUGGING.md.
         """
         self.fd = os.open(self.cfg.capture_device, os.O_RDWR | os.O_NONBLOCK)
         log.info('Opened %s (fd=%d)', self.cfg.capture_device, self.fd)
 
         set_sensor_gain(self.cfg)
+        setup_media_pipeline(self.cfg)
 
         fmt = V4L2Format()
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
         fmt.fmt.pix.width = self.cfg.sensor_width
         fmt.fmt.pix.height = self.cfg.sensor_height
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_pgAA
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SGRBG10
         fmt.fmt.pix.field = 1
         fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
         self.frame_size = fmt.fmt.pix.sizeimage
         self.stride = fmt.fmt.pix.bytesperline
         log.info(
-            'Format: %dx%d pgAA, stride=%d, frame_size=%d bytes',
+            'Format: %dx%d SGRBG10 (unpacked), stride=%d, frame_size=%d bytes',
             fmt.fmt.pix.width,
             fmt.fmt.pix.height,
             self.stride,
@@ -125,20 +232,18 @@ class V4L2Camera:
             fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
             log.debug('  buffer %d: length=%d offset=%d', i, buf.length, buf.m.offset)
 
-        log.info('Re-configuring media pipeline with device held open...')
-        setup_media_pipeline(self.cfg)
-
         buf_type = ctypes.c_int(V4L2_BUF_TYPE_VIDEO_CAPTURE)
         fcntl.ioctl(self.fd, VIDIOC_STREAMON, buf_type)
         log.info('Streaming started')
 
-    def _unpack_pgAA(self, raw: np.ndarray) -> np.ndarray:
-        """Unpack a pgAA frame buffer to an 8-bit Bayer array.
+    def _unpack_sgrbg10(self, raw: np.ndarray) -> np.ndarray:
+        """Unpack an unpacked-10-bit (V4L2_PIX_FMT_SGRBG10) frame to 8-bit.
 
-        pgAA is the IPU6 packed 10-bit format: each group of 5 bytes encodes
-        4 pixels as [P0_hi, P1_hi, P2_hi, P3_hi, lo_nibbles]. The high byte
-        of each pixel is used directly as an 8-bit value. The row stride is
-        padded to a 64-byte boundary and must be respected when reshaping.
+        Each pixel is a 16-bit little-endian value with the 10 significant
+        bits in the low bits (upper 6 bits zero-padded). Right-shifting by 2
+        recovers the same 8-bit approximation the previous packed-format
+        unpacking used (top 8 of the 10 significant bits). The row stride is
+        padded and must be respected when reshaping.
 
         Args:
             raw: Flat uint8 array of the raw frame buffer as read from mmap.
@@ -148,11 +253,10 @@ class V4L2Camera:
             the 8-bit Bayer mosaic values.
         """
         h, w, stride = self.cfg.sensor_height, self.cfg.sensor_width, self.stride
-        rows = raw[: h * stride].reshape(h, stride)
-        groups_per_row = stride // 5
-        pixels_per_row = groups_per_row * 4
-        bayer8 = rows[:, : groups_per_row * 5].reshape(h, groups_per_row, 5)[:, :, :4]
-        return bayer8.reshape(h, pixels_per_row)[:, :w].astype(np.uint8)
+        raw16 = raw.view(np.uint16)
+        stride_pixels = stride // 2
+        rows = raw16[: h * stride_pixels].reshape(h, stride_pixels)
+        return (rows[:, :w] >> 2).astype(np.uint8)
 
     def read_frame(self) -> memoryview | None:
         """Dequeue one V4L2 frame, debayer it, and return a BGRx memoryview.
@@ -189,7 +293,10 @@ class V4L2Camera:
             self._first_frame = False
             return None
 
-        bayer8 = self._unpack_pgAA(raw)
+        bayer8 = self._unpack_sgrbg10(raw)
+        if not self._wb_calibrated:
+            bayer8 = self._calibrate_exposure(bayer8)
+            self._calibrate_white_balance(bayer8)
         result = self._debayer(bayer8)
 
         log.debug(
@@ -213,7 +320,7 @@ class V4L2Camera:
 
         Args:
             bayer8: 2-D uint8 Bayer mosaic, shape (sensor_height, sensor_width),
-                as produced by _unpack_pgAA.
+                as produced by _unpack_sgrbg10.
 
         Returns:
             Memoryview into a pre-allocated bytearray (output_height *
@@ -221,21 +328,42 @@ class V4L2Camera:
         """
         b = bayer8[: self._h2, : self._w2]
 
-        # 2x2 block average debayer into pre-allocated half-res channel arrays
-        np.add(b[0::2, 0::2], b[1::2, 1::2], out=self._G, casting='unsafe')
+        # 2x2 block average debayer into pre-allocated half-res channel
+        # arrays. GRBG layout: G on the main diagonal (0,0)+(1,1), R at
+        # (0,1), B at (1,0) — matches the SGRBG10_1X10 media bus format
+        # actually negotiated with the hardware. A prior attempt to "fix" a
+        # magenta cast by swapping to an RGGB assumption was based on a
+        # misdiagnosis (the real bug at the time was elsewhere, in since-
+        # replaced packed-format unpacking) — confirmed wrong by directly
+        # comparing per-quad-position channel means from a real capture:
+        # the RGGB assignment produced R≈B with G suppressed (the magenta
+        # signature), while this GRBG assignment gives well-separated
+        # R/G/B means. See docs/DEBUGGING.md.
+        # np.add(uint8, uint8, out=uint16) computes the addition in uint8
+        # BEFORE widening to write into `out` — casting='unsafe' only
+        # permits the final cast, it doesn't make the arithmetic happen in
+        # the wider type. Two bright G samples (e.g. 200+200) silently
+        # wrapped mod 256 instead of summing to 400, corrupting the green
+        # channel in bright regions. Fix: copy (safe widening cast, not an
+        # arithmetic op) into the uint16 accumulator first, then += so the
+        # addition itself happens in uint16. See docs/DEBUGGING.md.
+        np.copyto(self._G, b[0::2, 0::2], casting='unsafe')
+        self._G += b[1::2, 1::2]
         self._G //= 2
         np.copyto(self._R, b[0::2, 1::2], casting='unsafe')
         np.copyto(self._B, b[1::2, 0::2], casting='unsafe')
 
         # Gather straight from half-res Bayer channels to output resolution (one
         # fancy-index copy per channel, no full-res intermediate) then apply
-        # brightness + white balance in-place at output size.
-        sr = np.uint16(5)
-        sg = np.uint16(4)  # 5 * 0.9 rounded
-        sb = np.uint16(5)  # 5 * 1.05 rounded
-        np.multiply(self._R[np.ix_(self._y_idx_half, self._x_idx_half)], sr, out=self._out_r, casting='unsafe')
-        np.multiply(self._G[np.ix_(self._y_idx_half, self._x_idx_half)], sg, out=self._out_g, casting='unsafe')
-        np.multiply(self._B[np.ix_(self._y_idx_half, self._x_idx_half)], sb, out=self._out_b, casting='unsafe')
+        # gray-world white balance (self._sr/_sg/_sb, calibrated once per
+        # session in _calibrate_white_balance() — see docs/DEBUGGING.md and
+        # #3 for real per-frame auto-gain as a further step beyond this).
+        np.multiply(self._R[np.ix_(self._y_idx_half, self._x_idx_half)], self._sr, out=self._out_r, casting='unsafe')
+        np.multiply(self._G[np.ix_(self._y_idx_half, self._x_idx_half)], self._sg, out=self._out_g, casting='unsafe')
+        np.multiply(self._B[np.ix_(self._y_idx_half, self._x_idx_half)], self._sb, out=self._out_b, casting='unsafe')
+        self._out_r >>= 6
+        self._out_g >>= 6
+        self._out_b >>= 6
         np.clip(self._out_r, 0, 255, out=self._out_r)
         np.clip(self._out_g, 0, 255, out=self._out_g)
         np.clip(self._out_b, 0, 255, out=self._out_b)

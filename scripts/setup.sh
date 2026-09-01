@@ -84,6 +84,12 @@ fi
 
 echo "==> Syncing Python dependencies..."
 cd "$REPO_ROOT/camera"
+# PyGObject (gi) is installed via apt against the system Python, not pip —
+# uv defaults to its own downloaded standalone Python build, which is a
+# completely separate interpreter with no visibility into apt's
+# dist-packages even with include-system-site-packages set. Pin the venv to
+# the actual system interpreter so it can see gi. See docs/DEBUGGING.md.
+[[ -d .venv ]] || uv venv --python /usr/bin/python3 --system-site-packages
 uv sync --dev
 
 echo ""

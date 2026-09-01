@@ -102,6 +102,19 @@ IPU6-based laptops too).
   Switched to `Gst.Buffer.new_allocate()` + `.fill()`, which allocates
   from GStreamer's own memory pool and copies into it instead.
 
+- **`free_device()` was killing the system's PipeWire multimedia service.**
+  Every `make run` broke live audio/mic routing (discovered mid-Teams-call).
+  The original implementation ran `fuser -k <device>` unconditionally to
+  clear the capture node before opening it — but `fuser` reported
+  `pipewire`/`wireplumber`'s PIDs as holding `/dev/video32` (WirePlumber
+  keeps a brief monitoring/enumeration handle on camera devices as part of
+  normal desktop media-session management, not an exclusive streaming
+  lock), and `fuser -k` killed them along with everything else, taking the
+  whole system's audio down with it. Fixed by checking each held-device
+  PID's process name via `ps -o comm=` first and never killing
+  `pipewire`/`wireplumber`/`pipewire-media-session` — only genuinely
+  conflicting processes get killed now.
+
 ## Environment setup issues
 
 - **Debian's packaged `v4l2loopback-dkms` can fail to build on newer
@@ -117,6 +130,27 @@ IPU6-based laptops too).
   builds that version from source via DKMS instead of relying on the apt
   package, so it still auto-rebuilds on kernel upgrades like a normal DKMS
   module.
+
+- **`ModuleNotFoundError: No module named 'gi'` when running via `uv run`/the
+  systemd service, even though `python3 -c "import gi"` works fine.**
+  PyGObject is installed via apt against the *system* Python
+  (`/usr/lib/python3/dist-packages`) — it's a C-extension GObject
+  Introspection binding, not something pip can build. `uv sync`/`uv venv`
+  by default download and manage their own standalone CPython build
+  (e.g. `~/.local/share/uv/python/cpython-3.14-...`), a completely
+  separate interpreter installation. Setting `include-system-site-packages
+  = true` in `pyvenv.cfg` doesn't help — it only adds *that interpreter's*
+  site-packages dir, and uv's standalone build has nothing installed via
+  apt. Fix: pin the venv to the actual system interpreter so
+  system-site-packages correctly points at the dist-packages `gi` is
+  actually in:
+  ```bash
+  uv venv --python /usr/bin/python3 --system-site-packages
+  uv sync --dev
+  ```
+  `Makefile`'s `sync`/`install` targets and `scripts/setup.sh` do this
+  automatically now — `uv sync` alone (without a pre-existing correctly
+  configured `.venv`) will silently create a venv that can't see `gi`.
 
 - **`/dev/video48` gets created root-only.** Manually `modprobe`-ing
   `v4l2loopback` without the distro package's udev rule leaves the device

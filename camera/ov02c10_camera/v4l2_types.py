@@ -16,7 +16,15 @@ VIDIOC_STREAMON = 0x40045612
 VIDIOC_STREAMOFF = 0x40045613
 V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
 V4L2_MEMORY_MMAP = 1
-V4L2_PIX_FMT_pgAA = 0x41416770
+# Unpacked 10-bit raw Bayer ('BA10' fourcc) — each pixel stored as a 16-bit
+# little-endian value, 10 significant bits, 6 bits zero-padded. This is what
+# libcamera/cam successfully requests on this hardware, repeatedly, with no
+# issue. The packed variant (V4L2_PIX_FMT_SGRBG10P, 'pgAA', 5 bytes per 4
+# pixels — what this code used to request) triggers a CSI2 receiver bug on
+# any stream start after the first (dmesg: "Frame sync error" / "Transfer
+# FIFO overflow"), confirmed via strace comparison against a working `cam`
+# capture. See docs/DEBUGGING.md.
+V4L2_PIX_FMT_SGRBG10 = 0x30314142
 
 
 class V4L2PixFormat(ctypes.Structure):

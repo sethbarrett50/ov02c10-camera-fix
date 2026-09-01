@@ -62,3 +62,53 @@ def test_run_cmd_does_not_raise_on_nonzero_exit() -> None:
     """check=True only logs a warning, it never raises — callers inspect returncode."""
     result = media_pipeline.run_cmd(['false'])
     assert result.returncode != 0
+
+
+def test_free_device_never_kills_pipewire_or_wireplumber(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PipeWire/WirePlumber holding the camera device is normal, not a conflict.
+
+    An earlier version killed whatever fuser reported unconditionally,
+    which killed the system's whole PipeWire multimedia service (and with
+    it, live audio/mic routing) every time this app started. See
+    docs/DEBUGGING.md.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        if cmd[0] == 'fuser':
+            return _fake_completed_process('477393 477395\n')
+        if cmd[0] == 'ps':
+            names = {'477393': 'pipewire', '477395': 'wireplumber'}
+            return _fake_completed_process(names.get(cmd[2], '') + '\n')
+        return _fake_completed_process('')
+
+    monkeypatch.setattr(media_pipeline, 'run_cmd', fake_run_cmd)
+    monkeypatch.setattr(media_pipeline.time, 'sleep', lambda *_: None)
+
+    media_pipeline.free_device('/dev/video32')
+
+    kill_calls = [c for c in calls if c[0] == 'kill']
+    assert kill_calls == []
+
+
+def test_free_device_kills_genuinely_conflicting_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-critical process actually holding the device still gets killed."""
+    calls: list[list[str]] = []
+
+    def fake_run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        if cmd[0] == 'fuser':
+            return _fake_completed_process('12345\n')
+        if cmd[0] == 'ps':
+            return _fake_completed_process('some_other_app\n')
+        return _fake_completed_process('')
+
+    monkeypatch.setattr(media_pipeline, 'run_cmd', fake_run_cmd)
+    monkeypatch.setattr(media_pipeline.time, 'sleep', lambda *_: None)
+
+    media_pipeline.free_device('/dev/video32')
+
+    kill_calls = [c for c in calls if c[0] == 'kill']
+    assert len(kill_calls) == 1
+    assert '12345' in kill_calls[0]
