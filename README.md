@@ -68,10 +68,26 @@ make install
 re-run.
 
 `make install` copies `camera/` to `~/code/ov02c10-camera-fix/camera`,
-syncs deps there, and installs the systemd unit + resource-cap override
-from `systemd/`. The `override.conf` caps the service at 1GB RAM / 1.5 CPU
-cores as a safety net — if a future regression leaks resources again,
-systemd kills and restarts it instead of it taking down your machine.
+syncs deps there, and installs two systemd `--user` units + a resource-cap
+override from `systemd/`:
+
+- `ov02c10-camera-watcher.service` — a lightweight always-on watcher
+  (enabled to start at login) that polls whether anything actually has
+  `/dev/video48` open (Brave, Zoom, Discord, ...)
+- `ov02c10-camera.service` — the actual camera/GStreamer pipeline, started
+  and stopped on-demand *by the watcher*, not enabled for auto-start
+  itself. Running the camera hardware continuously from login was wasted
+  CPU/power for a webcam that's only used occasionally.
+
+So after `make install`, nothing shows video until an app actually opens
+the loopback device — the camera light/pipeline turns on within a few
+seconds of opening Brave's camera picker (or similar) and turns off a few
+seconds after the last consumer closes it. `make logs`/`make logs-watcher`
+tail each service's journal if you want to watch this happen.
+
+The `override.conf` caps the camera service at 1GB RAM / 1.5 CPU cores as
+a safety net — if a future regression leaks resources again, systemd
+kills and restarts it instead of it taking down your machine.
 
 Run `make help` to see every available command (`make test`, `make logs`,
 `make gain`, `make lint`, etc.).

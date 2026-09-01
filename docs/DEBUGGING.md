@@ -160,6 +160,21 @@ IPU6-based laptops too).
   `video` group — both handled by `scripts/setup.sh`. Group membership
   changes require logging out and back in to take effect.
 
+## Design decisions
+
+- **On-demand activation is polling-based, not inotify.** #10 asked for
+  the camera to only run while something has `/dev/video48` open, instead
+  of continuously from login. The natural first idea was an inotify watch
+  on the device node for open/close events — but our own service's
+  GStreamer `v4l2sink` also opens `/dev/video48` (as the producer), so a
+  raw inotify event stream can't cleanly distinguish "an external app
+  just opened it" from "the service we just started opened it as the
+  writer" without deeper per-fd tracking. `scripts/camera_watcher.sh`
+  polls `fuser /dev/video48` instead and excludes the service's own
+  `MainPID` (from `systemctl --user show -p MainPID`), which sidesteps
+  that ambiguity entirely at the cost of being bounded by a poll interval
+  (3s) rather than instant.
+
 ## Useful diagnostic commands
 
 ```bash
