@@ -2,6 +2,11 @@
 Description=OV02C10 IPU6 Camera
 After=graphical-session.target
 
+# No [Install] section / not `systemctl --user enable`d — this service is
+# only ever started/stopped on-demand by ov02c10-camera-watcher.service,
+# based on whether anything actually has /dev/video48 open. Running the
+# camera hardware/GStreamer pipeline continuously from login was wasted
+# CPU/power for a webcam that's used occasionally. See #10.
 [Service]
 Type=simple
 Environment=DISPLAY=:1
@@ -9,6 +14,3 @@ WorkingDirectory=%h/code/ov02c10-camera-fix/camera
 ExecStart=%h/code/ov02c10-camera-fix/camera/.venv/bin/ov02c10-camera --loopback
 Restart=on-failure
 RestartSec=3
-
-[Install]
-WantedBy=graphical-session.target
