@@ -44,6 +44,9 @@ light. See [open issues](../../issues) for planned improvements.
 - `v4l-utils` (`media-ctl`, `v4l2-ctl`)
 - [`uv`](https://docs.astral.sh/uv/) for Python dependency management
 
+Run `make help` for shortcuts covering everything below (`make sync`,
+`make run`, `make install`, `make gain`, `make logs`, etc.).
+
 ## Setup
 
 ```bash

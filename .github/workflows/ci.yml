@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  lint-and-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer + PyGObject system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gst-1.0 gstreamer1.0-tools \
+            gstreamer1.0-plugins-base v4l-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install project deps
+        working-directory: camera
+        run: uv sync
+
+      - name: Ruff lint
+        working-directory: camera
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        working-directory: camera
+        run: uv run ruff format --check .
+
+      - name: Byte-compile (syntax check)
+        working-directory: camera
+        run: uv run python -m py_compile main.py
+
+      # gi/GStreamer come from apt (python3-gi), not the uv venv — PyGObject
+      # needs libgirepository/cairo system libs to build from pip, so this
+      # uses the system python3 directly rather than uv run.
+      - name: GStreamer import check
+        run: |
+          python3 -c "
+          import gi
+          gi.require_version('Gst', '1.0')
+          from gi.repository import Gst
+          Gst.init(None)
+          print('GStreamer', Gst.version_string(), 'importable OK')
+          "
