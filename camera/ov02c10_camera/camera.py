@@ -100,40 +100,96 @@ class V4L2Camera:
         clip before white-balance correction can help — observed raw means
         as high as 235/255 with the fixed gain, with the room's actual
         brightness swinging more than 2x between test runs minutes apart.
-        This is a one-shot brightness check + gain adjustment from the
-        first real frame, not a continuous AE loop (see #3 for that). If
-        the frame is already in a reasonable range, no change is made.
+        This is a one-shot startup calibration from the first real frame
+        (an initial brightness-average check, then up to 3 bounded
+        follow-up passes), not a continuous AE loop (see #3 for that). The
+        follow-up passes specifically check the clipped-pixel fraction
+        rather than the whole-frame average, since a bright subregion
+        (e.g. a face) can stay badly clipped even when the overall average
+        already looks fine if the rest of the scene is dim enough to
+        balance it out — a single fixed reduction step wasn't always
+        enough either, so each pass steps harder (0.5x vs 0.7x) when
+        clipping is more severe and stops once it's resolved or the gain
+        floor is reached. If the frame is already in a reasonable range
+        with no significant clipping, no change is made.
 
         Args:
             bayer8: 2-D uint8 Bayer mosaic from the first real frame.
 
         Returns:
-            A frame captured after the gain change settles, or the
+            A frame captured after the last gain change settles, or the
             original frame unchanged if no adjustment was needed.
         """
         b = bayer8[: self._h2, : self._w2]
         brightness = float(b.mean())
         target = 128.0
+        gain = self.cfg.analogue_gain
+
         if 90.0 <= brightness <= 170.0:
             log.info('Exposure OK at startup (brightness=%.1f/255), no gain adjustment', brightness)
-            return bayer8
+        else:
+            ratio = target / max(brightness, 1.0)
+            gain = max(16, min(248, round(gain * ratio)))
+            log.info(
+                'Adjusting analogue_gain %d -> %d (brightness=%.1f/255, target=%.0f)',
+                self.cfg.analogue_gain,
+                gain,
+                brightness,
+                target,
+            )
+            settled = self._apply_gain_and_settle(gain)
+            if settled is not None:
+                bayer8 = settled
 
-        ratio = target / max(brightness, 1.0)
-        new_gain = max(16, min(248, round(self.cfg.analogue_gain * ratio)))
-        log.info(
-            'Adjusting analogue_gain %d -> %d (brightness=%.1f/255, target=%.0f)',
-            self.cfg.analogue_gain,
-            new_gain,
-            brightness,
-            target,
-        )
+        # A bright subregion (e.g. a face) can stay significantly clipped
+        # even when the whole-frame average already looks fine, if the
+        # rest of the scene is dim enough to balance it out — reported
+        # live as a face that looks blown out ("like headlights") despite
+        # the calibration log showing reasonable numbers (those numbers
+        # exclude the clipped region entirely, see
+        # _calibrate_white_balance). Check the clipped-pixel fraction
+        # specifically and reduce gain further if it's still high.
+        #
+        # Iterates (bounded) rather than a single fixed step: a scene with
+        # a lot of dynamic range between subject and background needed
+        # more than one 0.7x reduction to actually clear (observed 75%
+        # still clipped after the first follow-up pass alone). Steps
+        # harder when clipping is more severe. See #16.
+        for _ in range(3):
+            clipped_fraction = float((bayer8[: self._h2, : self._w2] >= 250).mean())
+            if clipped_fraction <= 0.10:
+                break
+            step = 0.5 if clipped_fraction > 0.5 else 0.7
+            new_gain = max(16, round(gain * step))
+            if new_gain == gain:
+                break  # already at the gain floor, further attempts won't help
+            gain = new_gain
+            log.info(
+                '%.0f%% of frame still clipped — reducing analogue_gain further to %d', clipped_fraction * 100, gain
+            )
+            settled = self._apply_gain_and_settle(gain)
+            if settled is None:
+                break
+            bayer8 = settled
+
+        return bayer8
+
+    def _apply_gain_and_settle(self, new_gain: int) -> np.ndarray | None:
+        """Write a new analogue_gain value and capture a frame after it settles.
+
+        Args:
+            new_gain: Value to set for the sensor's analogue_gain control.
+
+        Returns:
+            Unpacked bayer8 from a frame captured after the change, or
+            None if no frame arrived within the timeout.
+        """
         sensor_entity = find_sensor_entity(self.cfg.media_device)
         subdev = run_cmd(['media-ctl', '-d', self.cfg.media_device, '-e', sensor_entity]).stdout.strip()
         run_cmd(['v4l2-ctl', '-d', subdev, '-c', f'analogue_gain={new_gain}'])
 
-        # Let the new exposure settle before using a frame for calibration.
         raw = None
-        for _ in range(2):
+        for _ in range(4):
             r, _, _ = select.select([self.fd], [], [], 2.0)
             if not r:
                 break
@@ -144,7 +200,7 @@ class V4L2Camera:
             self.buffers[buf.index].seek(0)
             raw = np.frombuffer(self.buffers[buf.index].read(buf.bytesused), dtype=np.uint8)
             fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
-        return self._unpack_sgrbg10(raw) if raw is not None else bayer8
+        return self._unpack_sgrbg10(raw) if raw is not None else None
 
     def _calibrate_white_balance(self, bayer8: np.ndarray) -> None:
         """Derive gray-world white-balance gains from one real frame.
@@ -156,13 +212,32 @@ class V4L2Camera:
         start (see read_frame()), not every frame — cheap, and avoids
         gain hunting from frame-to-frame scene variation.
 
+        2x2 quads with any near-clipped channel (>=250/255) are excluded
+        from the average. A face filling most of the frame isn't neutral
+        gray (real red bias) and, if bright/near-blown-out, skews the
+        whole-frame gray-world ratio hard enough to produce a visible cast
+        on the actually-neutral background — observed as a bright/white
+        face with a green-tinted background. See #16 and docs/DEBUGGING.md.
+
         Args:
             bayer8: 2-D uint8 Bayer mosaic to calibrate from.
         """
-        b = bayer8[: self._h2, : self._w2].astype(np.float64)
-        r_mean = b[0::2, 1::2].mean()
-        g_mean = (b[0::2, 0::2].mean() + b[1::2, 1::2].mean()) / 2
-        b_mean = b[1::2, 0::2].mean()
+        b = bayer8[: self._h2, : self._w2]
+        r_ch = b[0::2, 1::2]
+        g1_ch = b[0::2, 0::2]
+        g2_ch = b[1::2, 1::2]
+        b_ch = b[1::2, 0::2]
+
+        valid = (r_ch < 250) & (g1_ch < 250) & (g2_ch < 250) & (b_ch < 250)
+        if valid.sum() < valid.size * 0.05:
+            # Almost everything is clipped (e.g. a very bright scene) —
+            # excluding it all would leave too few samples to be
+            # meaningful, so fall back to the full, unmasked frame.
+            valid = np.ones_like(valid)
+
+        r_mean = r_ch[valid].astype(np.float64).mean()
+        g_mean = (g1_ch[valid].astype(np.float64).mean() + g2_ch[valid].astype(np.float64).mean()) / 2
+        b_mean = b_ch[valid].astype(np.float64).mean()
 
         def gain(target: float, source: float) -> np.uint16:
             if source < 1:

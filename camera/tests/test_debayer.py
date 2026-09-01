@@ -98,6 +98,29 @@ def test_calibrate_white_balance_clamps_extreme_ratios() -> None:
     assert int(cam._sr) == 192
 
 
+def test_calibrate_white_balance_excludes_clipped_regions() -> None:
+    """A blown-out region (e.g. a bright face) shouldn't skew the gray-world ratio.
+
+    Regression test for #16: whole-frame gray-world calibration was biased
+    by face-dominated framing, producing a bright/white face with a
+    green-tinted background.
+    """
+    cfg = CameraConfig()
+    cam = V4L2Camera(cfg)
+    bayer8 = _solid_color_bayer(cfg, r=100, g=150, b=75)
+    # Overwrite the top quarter of the frame with a fully clipped region —
+    # simulates a blown-out face filling part of the shot.
+    quarter_h = (cfg.sensor_height // 4) // 2 * 2
+    bayer8[:quarter_h, :] = 255
+
+    cam._calibrate_white_balance(bayer8)
+
+    # Should match the un-clipped region's ratios exactly, unaffected by
+    # the clipped region — same values as the fully-neutral-frame test.
+    assert int(cam._sr) == 96
+    assert int(cam._sb) == 128
+
+
 def test_debayer_output_shape_matches_configured_output_resolution() -> None:
     """Output must match output_width/output_height regardless of sensor size."""
     cfg = CameraConfig(output_width=320, output_height=240)
