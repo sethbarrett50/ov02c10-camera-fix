@@ -6,7 +6,7 @@ RUFF  ?= ruff
 PY    ?= python
 CAM   := camera
 
-.PHONY: help setup sync lint format check test build clean preflight deps.check run install logs gain
+.PHONY: help setup sync lint format check test build clean preflight deps.check run run-loopback install logs gain
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -44,8 +44,11 @@ preflight: ## Build + run twine metadata checks
 deps.check: ## Check for dependency issues
 	cd $(CAM) && $(UV) run deptry .
 
-run: ## Run camera preview in the foreground (Ctrl+C to stop)
+run: ## Run camera preview window in the foreground (Ctrl+C to stop)
 	cd $(CAM) && $(UV) run ov02c10-camera
+
+run-loopback: ## Feed /dev/video48 in the foreground for browser testing (Ctrl+C to stop)
+	cd $(CAM) && $(UV) run ov02c10-camera --loopback
 
 install: ## Install as a systemd --user service (loopback mode, resource-capped)
 	mkdir -p ~/code/ov02c10-camera-fix
