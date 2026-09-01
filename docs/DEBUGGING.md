@@ -1,0 +1,120 @@
+# Debugging notes: OV02C10 / Intel IPU6 on Debian
+
+This documents the investigation behind this repo, for anyone hitting the
+same wall on similar hardware (Dell XPS 16, OV02C10 sensor, Intel IPU6
+image processor, mainline/Debian kernel — likely applicable to other
+IPU6-based laptops too).
+
+## The three candidate approaches, and why two are dead ends
+
+1. **`libcamera` (via `cam`, `pipewire-libcamera`, etc.)** — sees the
+   camera and can capture, but only through its `uncalibrated.yaml`
+   fallback IPA, since no `ov02c10.yaml` tuning file has been upstreamed
+   for this sensor. Symptom: `cam --list-controls` and captures work, but
+   there is no real AGC (auto gain control) loop — frame 1 after stream
+   start carries a valid image, every frame after it goes solid black.
+   Root cause: `IPASoft: Failed to create camera sensor helper for
+   ov02c10` — libcamera's software ISP has no registered
+   `CameraSensorHelper` for this sensor model, so its blind AGC can't
+   correctly convert between register gain values and real-world units,
+   and drives exposure/gain to the floor. Fixing this properly means
+   patching and rebuilding libcamera itself to add a sensor helper —
+   possible, but a real C++ change, not a config tweak.
+
+2. **Intel's proprietary HAL (`icamerasrc` / `libcamhal`, GStreamer)** —
+   if it's already installed (`libcamhal-ipu6epmtl` /
+   `gstreamer1.0-icamera`, likely pulled in as an Ubuntu OEM `.deb`, since
+   Debian's own repos don't ship it), `gst-inspect-1.0 icamerasrc` will
+   correctly detect the sensor by name (`ov02c10-uf`) and it *does* ship
+   real per-module `.aiqb` tuning data under `/etc/camera/ipu6epmtl/`.
+   It still fails, though:
+   ```
+   CamHAL[ERR] Failed to open PSYS, error: No such file or directory
+   ```
+   PSYS is the IPU6's hardware image processor (does debayer/3A in
+   silicon). Check what's actually loaded:
+   ```bash
+   lsmod | grep -i ipu6
+   find /lib/modules/"$(uname -r)" -iname "*ipu6*"
+   ```
+   On mainline/Debian kernels you'll typically find `intel-ipu6.ko` and
+   `intel-ipu6-isys.ko` (capture-only) but **no `intel-ipu6-psys.ko`** —
+   that driver only ships in Ubuntu's OEM-patched kernels or Intel's
+   out-of-tree `ipu6-drivers` DKMS package. Getting this path working
+   means building and maintaining an out-of-tree kernel module against
+   your exact kernel version — real ongoing risk, breaks on every kernel
+   update. Not worth it unless you have no other option.
+
+3. **Raw V4L2 capture + software debayer (what this repo does)** — bypass
+   both of the above. Open the ISYS capture node directly, pull raw
+   packed-10-bit Bayer frames, debayer and gain-correct them in Python
+   with numpy, and feed the result into a GStreamer `appsrc` pipeline.
+   No PSYS, no libcamera IPA, no proprietary HAL. Slower and cruder than
+   real ISP hardware, but it's the only path that doesn't depend on
+   kernel modules you don't have.
+
+## Bugs found and fixed in the raw-capture path
+
+- **Stale hardcoded I2C bus number.** The sensor's media-controller entity
+  name embeds its I2C bus (e.g. `ov02c10 5-0036`), and that bus number is
+  **not stable across boots** — ACPI enumerates I2C devices in a
+  different order depending on boot state. A hardcoded bus number will
+  silently go stale (all `media-ctl` calls referencing it fail, but with
+  `check=False` logging they don't loudly break anything). Resolve it
+  live instead:
+  ```bash
+  media-ctl -d /dev/media0 -p | grep -i ov02c10
+  ```
+  `find_sensor_entity()` in `camera/main.py` does this automatically at
+  every startup instead of hardcoding a bus number.
+
+- **No exposure/gain control at all.** There's no AE/AGC loop anywhere in
+  the raw V4L2 path — the sensor sits at whatever its driver's power-on
+  defaults are. On this hardware that turned out to be `exposure` pinned
+  at its **maximum** (2320/2320) with `analogue_gain` barely off the
+  floor (20/248) and `digital_gain` at rock bottom (1024/16383) — i.e.
+  a very dark raw signal with no compensating gain, even in a well-lit
+  room. Check current values with:
+  ```bash
+  v4l2-ctl -d "$(media-ctl -d /dev/media0 -e 'ov02c10 5-0036')" -l
+  ```
+  `set_sensor_gain()` sets `analogue_gain`/`digital_gain` explicitly via
+  `VIDIOC_S_CTRL` on the sensor subdevice before streaming starts. The
+  defaults in this repo (`analogue_gain=150`, `digital_gain=4096`) were
+  tuned for one indoor room and are a fixed value, not real auto-exposure
+  — retune via `--analogue-gain`/`--digital-gain` if your lighting is
+  very different.
+
+- **CPU/memory blowup in the debayer step.** The original debayer
+  upsampled half-resolution R/G/B channels all the way back up to *full*
+  sensor resolution with `np.repeat` (six large temporary array
+  allocations per frame, ~30MB/frame at 30fps) and then immediately threw
+  most of it away downsampling to the actual output resolution. This
+  pegged a CPU core and, combined with sustained large-block allocation
+  churn, drove RSS into the tens of GB within seconds via allocator arena
+  growth. Fixed by gathering directly from half-res to output resolution
+  with a single indexed copy per channel — no full-resolution
+  intermediate at all.
+
+- **Per-frame `Gst.Buffer` leak.** `Gst.Buffer.new_wrapped(bytes(view))`
+  called every frame ties a fresh Python `bytes` object to a new
+  `GstBuffer` 30 times a second; in practice it was never being reclaimed.
+  Switched to `Gst.Buffer.new_allocate()` + `.fill()`, which allocates
+  from GStreamer's own memory pool and copies into it instead.
+
+## Useful diagnostic commands
+
+```bash
+# Find the sensor's current media-controller entity (bus number can change per boot)
+media-ctl -d /dev/media0 -p | grep -i ov02c10
+
+# Current sensor control values (exposure, gain, etc.)
+v4l2-ctl -d "$(media-ctl -d /dev/media0 -e 'ov02c10 <BUS>-0036')" -l
+
+# Set gain manually for a quick test
+v4l2-ctl -d "$(media-ctl -d /dev/media0 -e 'ov02c10 <BUS>-0036')" -c analogue_gain=150,digital_gain=4096
+
+# Confirm whether PSYS is available at all before attempting the proprietary HAL route
+lsmod | grep -i ipu6
+find /lib/modules/"$(uname -r)" -iname "*ipu6*psys*"
+```

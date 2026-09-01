@@ -1,0 +1,14 @@
+[Unit]
+Description=OV02C10 IPU6 Camera
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+WorkingDirectory=%h/code/ov02c10-camera-fix/camera
+ExecStart=%h/code/ov02c10-camera-fix/camera/.venv/bin/python main.py --loopback
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

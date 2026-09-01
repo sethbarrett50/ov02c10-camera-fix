@@ -1,0 +1,14 @@
+[project]
+name = "ov02c10-camera-fix"
+version = "0.1.0"
+description = "Working camera capture for the OV02C10 / Intel IPU6 sensor on Debian, bypassing the unmaintained libcamera fallback and unavailable proprietary HAL"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]
