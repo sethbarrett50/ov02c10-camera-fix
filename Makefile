@@ -15,6 +15,7 @@ setup: ## Bootstrap a fresh box: apt packages, v4l2loopback, uv, deps
 	./scripts/setup.sh
 
 sync: ## Install/sync deps (including dev group)
+	cd $(CAM) && [ -d .venv ] || $(UV) venv --python /usr/bin/python3 --system-site-packages
 	cd $(CAM) && $(UV) sync --dev
 
 format: ## Format code
@@ -48,7 +49,10 @@ run: ## Run camera preview in the foreground (Ctrl+C to stop)
 
 install: ## Install as a systemd --user service (loopback mode, resource-capped)
 	mkdir -p ~/code/ov02c10-camera-fix
+	rm -rf ~/code/ov02c10-camera-fix/camera
 	cp -r $(CAM) ~/code/ov02c10-camera-fix/
+	rm -rf ~/code/ov02c10-camera-fix/camera/.venv ~/code/ov02c10-camera-fix/camera/__pycache__ ~/code/ov02c10-camera-fix/camera/.ruff_cache
+	cd ~/code/ov02c10-camera-fix/camera && $(UV) venv --python /usr/bin/python3 --system-site-packages
 	cd ~/code/ov02c10-camera-fix/camera && $(UV) sync
 	mkdir -p ~/.config/systemd/user/ov02c10-camera.service.d
 	cp systemd/ov02c10-camera.service ~/.config/systemd/user/

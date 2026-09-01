@@ -118,6 +118,27 @@ IPU6-based laptops too).
   package, so it still auto-rebuilds on kernel upgrades like a normal DKMS
   module.
 
+- **`ModuleNotFoundError: No module named 'gi'` when running via `uv run`/the
+  systemd service, even though `python3 -c "import gi"` works fine.**
+  PyGObject is installed via apt against the *system* Python
+  (`/usr/lib/python3/dist-packages`) — it's a C-extension GObject
+  Introspection binding, not something pip can build. `uv sync`/`uv venv`
+  by default download and manage their own standalone CPython build
+  (e.g. `~/.local/share/uv/python/cpython-3.14-...`), a completely
+  separate interpreter installation. Setting `include-system-site-packages
+  = true` in `pyvenv.cfg` doesn't help — it only adds *that interpreter's*
+  site-packages dir, and uv's standalone build has nothing installed via
+  apt. Fix: pin the venv to the actual system interpreter so
+  system-site-packages correctly points at the dist-packages `gi` is
+  actually in:
+  ```bash
+  uv venv --python /usr/bin/python3 --system-site-packages
+  uv sync --dev
+  ```
+  `Makefile`'s `sync`/`install` targets and `scripts/setup.sh` do this
+  automatically now — `uv sync` alone (without a pre-existing correctly
+  configured `.venv`) will silently create a venv that can't see `gi`.
+
 - **`/dev/video48` gets created root-only.** Manually `modprobe`-ing
   `v4l2loopback` without the distro package's udev rule leaves the device
   node as `crw------- root root` — neither a `systemd --user` service nor
