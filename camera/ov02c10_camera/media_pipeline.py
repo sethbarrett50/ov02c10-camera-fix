@@ -100,6 +100,15 @@ def setup_media_pipeline(cfg: CameraConfig) -> None:
                 '"Intel IPU6 CSI2 4":1->"Intel IPU6 ISYS Capture 32":0[1]',
             ],
         ),
+        # Sets the sensor's own output pad format. Without this, the sensor
+        # keeps whatever format the last process (e.g. `cam`) configured it
+        # to, which can silently mismatch what we tell the CSI2 receiver to
+        # expect below — the likely cause of the CSI2 "Frame sync error" /
+        # "Transfer FIFO overflow" errors on VIDIOC_STREAMON after the first
+        # run. `cam`/libcamera sets this via VIDIOC_SUBDEV_S_FMT on every
+        # invocation (confirmed via strace); this had no equivalent here.
+        # See docs/DEBUGGING.md.
+        ('sensor fmt', ['media-ctl', '-d', cfg.media_device, '--set-v4l2', f'"{sensor_entity}":0[fmt:{fmt}]']),
         ('IVSC sink fmt', ['media-ctl', '-d', cfg.media_device, '--set-v4l2', f'"Intel IVSC CSI":0[fmt:{fmt}]']),
         ('IVSC source fmt', ['media-ctl', '-d', cfg.media_device, '--set-v4l2', f'"Intel IVSC CSI":1[fmt:{fmt}]']),
         ('CSI2-4 sink fmt', ['media-ctl', '-d', cfg.media_device, '--set-v4l2', f'"Intel IPU6 CSI2 4":0[fmt:{fmt}]']),
@@ -110,16 +119,42 @@ def setup_media_pipeline(cfg: CameraConfig) -> None:
         log.info('  %s %s', '✓' if r.returncode == 0 else '⚠', desc)
 
 
+CRITICAL_PROCESSES = {'pipewire', 'wireplumber', 'pipewire-media-session'}
+
+
 def free_device(device: str) -> None:
-    """Kill any process holding the given device node open.
+    """Kill any non-critical process holding the given device node open.
+
+    Never kills system multimedia services (PipeWire/WirePlumber) even if
+    fuser reports them holding the device — WirePlumber holds a brief
+    monitoring/enumeration handle on camera devices as part of normal
+    desktop media-session management, not an exclusive streaming lock. An
+    earlier version of this function used `fuser -k <device>` unconditionally,
+    which killed PipeWire itself every time this app started, taking the
+    whole system's audio routing down along with it (discovered because a
+    live Teams call's microphone stopped working every time the camera
+    service ran). See docs/DEBUGGING.md.
 
     Args:
         device: Path to the device node to check, e.g. '/dev/video32'.
     """
     result = run_cmd(['fuser', device], check=False)
-    if result.stdout.strip():
-        log.warning('Device held by PIDs %s — killing', result.stdout.strip())
-        run_cmd(['fuser', '-k', device], check=False)
+    pids = result.stdout.split()
+    if not pids:
+        log.info('Device %s is free', device)
+        return
+
+    to_kill = []
+    for pid in pids:
+        name = run_cmd(['ps', '-p', pid, '-o', 'comm='], check=False).stdout.strip()
+        if name in CRITICAL_PROCESSES:
+            log.warning('  %s (pid %s) holds %s — leaving it alone (normal media-session handle)', name, pid, device)
+        else:
+            to_kill.append(pid)
+
+    if to_kill:
+        log.warning('Device %s held by PIDs %s — killing', device, ' '.join(to_kill))
+        run_cmd(['kill', '-9', *to_kill], check=False)
         time.sleep(1)
     else:
-        log.info('Device %s is free', device)
+        log.info('Device %s: only critical services holding it, proceeding', device)

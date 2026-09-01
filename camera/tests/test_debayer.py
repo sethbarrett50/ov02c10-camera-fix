@@ -1,4 +1,4 @@
-"""Tests for the debayer + gain-correction math — pure numpy, no hardware needed.
+"""Tests for the debayer + white-balance math — pure numpy, no hardware needed.
 
 Regression coverage for the CPU/memory blowup fix: the debayer step used
 to upsample half-res channels to full sensor resolution with np.repeat
@@ -17,8 +17,10 @@ from ov02c10_camera.config import CameraConfig
 def _solid_color_bayer(cfg: CameraConfig, r: int, g: int, b: int) -> np.ndarray:
     """Build a full-size Bayer mosaic where every 2x2 quad is the same R/G/B.
 
-    Matches the SGRBG pattern V4L2Camera._debayer assumes: (0,0)/(1,1)=G,
-    (0,1)=R, (1,0)=B.
+    Matches the GRBG pattern V4L2Camera._debayer assumes: (0,0)/(1,1)=G,
+    (0,1)=R, (1,0)=B. Confirmed against real hardware by directly comparing
+    per-quad-position channel means from a live capture — see
+    docs/DEBUGGING.md.
 
     Args:
         cfg: Camera config supplying sensor dimensions.
@@ -37,14 +39,17 @@ def _solid_color_bayer(cfg: CameraConfig, r: int, g: int, b: int) -> np.ndarray:
     return bayer8
 
 
-def test_debayer_applies_known_gain_and_clips() -> None:
-    """R*5, G*4, B*5 gains, clipped to 255 — the exact values tuned on hardware.
+def test_debayer_defaults_to_identity_gain_when_uncalibrated() -> None:
+    """Before white-balance calibration runs, gains are identity (64/64 = 1.0x).
 
-    See docs/DEBUGGING.md for how these were picked (gray-room test).
+    _debayer() itself never picks gain values — only _calibrate_white_balance()
+    does, and only real streamed frames trigger it via read_frame(). Calling
+    _debayer() directly (as these tests do) never calibrates, so output should
+    exactly match input.
     """
     cfg = CameraConfig()
     cam = V4L2Camera(cfg)
-    bayer8 = _solid_color_bayer(cfg, r=60, g=40, b=20)
+    bayer8 = _solid_color_bayer(cfg, r=60, g=200, b=20)
 
     result = cam._debayer(bayer8)
 
@@ -52,10 +57,45 @@ def test_debayer_applies_known_gain_and_clips() -> None:
     assert len(result) == cfg.output_height * cfg.output_width * 4
     out = np.frombuffer(result, dtype=np.uint8).reshape(cfg.output_height, cfg.output_width, 4)
     # BGRx channel order
-    assert np.unique(out[:, :, 0]).tolist() == [100]  # B: 20*5
-    assert np.unique(out[:, :, 1]).tolist() == [160]  # G: 40*4
-    assert np.unique(out[:, :, 2]).tolist() == [255]  # R: 60*5 clipped from 300
+    assert np.unique(out[:, :, 0]).tolist() == [20]  # B
+    assert np.unique(out[:, :, 1]).tolist() == [200]  # G
+    assert np.unique(out[:, :, 2]).tolist() == [60]  # R
     assert np.unique(out[:, :, 3]).tolist() == [0]  # x/alpha padding
+
+
+def test_calibrate_white_balance_equalizes_channels_to_green() -> None:
+    """Gray-world calibration scales R/B gain (6-bit fixed point) to match G's mean.
+
+    A flat/unstable software gain missed badly once room lighting changed
+    between test runs (raw frame mean moved from ~437 to ~915 out of 1023
+    within minutes) — see docs/DEBUGGING.md. Calibrating from the actual
+    first frame of each session tracks whatever lighting is really present.
+    """
+    cfg = CameraConfig()
+    cam = V4L2Camera(cfg)
+    # R mean 100, G mean 150, B mean 75 -> gains should scale R and B up to
+    # match G: sr = round(150/100*64) = 96, sb = round(150/75*64) = 128.
+    bayer8 = _solid_color_bayer(cfg, r=100, g=150, b=75)
+
+    cam._calibrate_white_balance(bayer8)
+
+    assert cam._wb_calibrated is True
+    assert int(cam._sr) == 96
+    assert int(cam._sg) == 64
+    assert int(cam._sb) == 128
+
+
+def test_calibrate_white_balance_clamps_extreme_ratios() -> None:
+    """A near-black or near-saturated channel shouldn't produce a huge/tiny gain."""
+    cfg = CameraConfig()
+    cam = V4L2Camera(cfg)
+    # R mean 1 (near-black) -> ratio would be huge without clamping
+    bayer8 = _solid_color_bayer(cfg, r=1, g=200, b=200)
+
+    cam._calibrate_white_balance(bayer8)
+
+    # Clamped to at most 3.0x -> round(3.0 * 64) = 192
+    assert int(cam._sr) == 192
 
 
 def test_debayer_output_shape_matches_configured_output_resolution() -> None:

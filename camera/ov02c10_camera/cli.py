@@ -7,7 +7,7 @@ import sys
 from .config import CameraConfig
 from .gst_pipeline import run_pipeline
 from .logging_setup import configure_logging
-from .media_pipeline import free_device, setup_media_pipeline
+from .media_pipeline import free_device
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--loopback', action='store_true', help='Feed /dev/video48 v4l2loopback instead of display window'
     )
-    parser.add_argument('--no-setup', action='store_true', help='Skip media pipeline configuration')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug-level logging')
     parser.add_argument(
         '--analogue-gain',
@@ -64,9 +63,6 @@ def main() -> int:
     log.info(
         'Sensor: %dx%d  ->  output: %dx%d', cfg.sensor_width, cfg.sensor_height, cfg.output_width, cfg.output_height
     )
-
-    if not args.no_setup:
-        setup_media_pipeline(cfg)
 
     free_device(cfg.capture_device)
     return run_pipeline(cfg)

@@ -102,6 +102,19 @@ IPU6-based laptops too).
   Switched to `Gst.Buffer.new_allocate()` + `.fill()`, which allocates
   from GStreamer's own memory pool and copies into it instead.
 
+- **`free_device()` was killing the system's PipeWire multimedia service.**
+  Every `make run` broke live audio/mic routing (discovered mid-Teams-call).
+  The original implementation ran `fuser -k <device>` unconditionally to
+  clear the capture node before opening it — but `fuser` reported
+  `pipewire`/`wireplumber`'s PIDs as holding `/dev/video32` (WirePlumber
+  keeps a brief monitoring/enumeration handle on camera devices as part of
+  normal desktop media-session management, not an exclusive streaming
+  lock), and `fuser -k` killed them along with everything else, taking the
+  whole system's audio down with it. Fixed by checking each held-device
+  PID's process name via `ps -o comm=` first and never killing
+  `pipewire`/`wireplumber`/`pipewire-media-session` — only genuinely
+  conflicting processes get killed now.
+
 ## Environment setup issues
 
 - **Debian's packaged `v4l2loopback-dkms` can fail to build on newer
