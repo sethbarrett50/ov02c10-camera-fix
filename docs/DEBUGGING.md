@@ -102,6 +102,30 @@ IPU6-based laptops too).
   Switched to `Gst.Buffer.new_allocate()` + `.fill()`, which allocates
   from GStreamer's own memory pool and copies into it instead.
 
+## Environment setup issues
+
+- **Debian's packaged `v4l2loopback-dkms` can fail to build on newer
+  kernels.** Trixie ships `v4l2loopback-dkms 0.15.0`, which fails against
+  kernel `6.17.13` with:
+  ```
+  error: implicit declaration of function 'setup_timer'
+  ```
+  `setup_timer()` was removed from the kernel timer API; upstream
+  `v4l2loopback` added a `#if defined(timer_setup)` compatibility branch
+  to handle this, but that fix landed after the `0.15.0` release Debian
+  packaged. Confirmed fixed as of upstream tag `v0.15.4`. `scripts/setup.sh`
+  builds that version from source via DKMS instead of relying on the apt
+  package, so it still auto-rebuilds on kernel upgrades like a normal DKMS
+  module.
+
+- **`/dev/video48` gets created root-only.** Manually `modprobe`-ing
+  `v4l2loopback` without the distro package's udev rule leaves the device
+  node as `crw------- root root` — neither a `systemd --user` service nor
+  a browser running as a regular user can open it. Fixed by installing a
+  udev rule (`GROUP="video", MODE="0660"`) and ensuring the user is in the
+  `video` group — both handled by `scripts/setup.sh`. Group membership
+  changes require logging out and back in to take effect.
+
 ## Useful diagnostic commands
 
 ```bash
