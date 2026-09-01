@@ -175,6 +175,45 @@ IPU6-based laptops too).
   that ambiguity entirely at the cost of being bounded by a poll interval
   (3s) rather than instant.
 
+## Known issue: on-demand activation (#10) doesn't work with Chrome/Brave
+
+`ov02c10-camera-watcher.service` was built to start the real camera
+pipeline only when something actually opens `/dev/video48`, instead of
+running it continuously from login (see Design decisions above). It
+doesn't work for browser use, and isn't fixable by tweaking the watcher —
+it's a structural conflict with how `v4l2loopback`'s `exclusive_caps=1`
+mode works:
+
+- With `exclusive_caps=1`, the device's reported V4L2 capability is *live*,
+  not persisted: it announces **OUTPUT-only** while no producer is
+  connected, and only switches to announcing **CAPTURE-only** — the mode
+  browsers filter on when enumerating cameras — while a producer is
+  actively holding it open. This is not a format that can be "primed" and
+  left; setting the format once via `v4l2-ctl --set-fmt-video-out` and
+  closing the fd immediately reverts the device to OUTPUT-only, confirmed
+  with `v4l2-ctl -d /dev/video48 --list-formats` returning empty again
+  right after.
+- Chrome/Brave's camera picker only lists devices currently reporting
+  CAPTURE capability, so with nothing producing, the device never appears
+  in the picker at all.
+- The watcher's activation trigger is "an external process has
+  `/dev/video48` open" (via polling `fuser`) — but a browser can't open a
+  device it can't see in its own picker. Nothing can ever trigger the
+  watcher from a cold start; it only works if something else already got
+  the device into CAPTURE mode first.
+
+Confirmed experimentally: running the pipeline continuously
+(`make run-loopback`, left running) shows up fine in Brave's picker.
+Relying on the watcher alone to start it on first open never shows up.
+
+**Current recommendation: don't use the on-demand watcher for browser use.**
+Run `make run-loopback` manually when you need the camera. The
+watcher/service code is left in the repo for reference — a real fix would
+need a always-on, low-cost placeholder producer that keeps the device in
+CAPTURE mode (e.g. a dummy blank-frame writer) and gets swapped for the
+real pipeline on demand, which is meaningfully more complex than the
+current polling design and hasn't been built.
+
 ## Useful diagnostic commands
 
 ```bash

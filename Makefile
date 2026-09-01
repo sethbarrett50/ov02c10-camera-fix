@@ -51,10 +51,10 @@ run-loopback: ## Feed /dev/video48 in the foreground for browser testing (Ctrl+C
 	cd $(CAM) && $(UV) run ov02c10-camera --loopback
 
 install: ## Install as systemd --user services: watcher auto-starts, camera runs on-demand
-	mkdir -p ~/code/ov02c10-camera-fix/scripts
-	rm -rf ~/code/ov02c10-camera-fix/camera
-	cp -r $(CAM) ~/code/ov02c10-camera-fix/
-	rm -rf ~/code/ov02c10-camera-fix/camera/.venv ~/code/ov02c10-camera-fix/camera/__pycache__ ~/code/ov02c10-camera-fix/camera/.ruff_cache
+	mkdir -p ~/code/ov02c10-camera-fix/camera ~/code/ov02c10-camera-fix/scripts
+	rsync -a --delete \
+		--exclude='.venv' --exclude='__pycache__' --exclude='.ruff_cache' --exclude='.claude' \
+		$(CAM)/ ~/code/ov02c10-camera-fix/camera/
 	cp scripts/camera_watcher.sh ~/code/ov02c10-camera-fix/scripts/
 	chmod +x ~/code/ov02c10-camera-fix/scripts/camera_watcher.sh
 	cd ~/code/ov02c10-camera-fix/camera && $(UV) venv --python /usr/bin/python3 --system-site-packages

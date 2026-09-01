@@ -19,6 +19,12 @@ DEVICE=/dev/video48
 SERVICE=ov02c10-camera
 POLL_INTERVAL=3
 STOP_AFTER_IDLE_POLLS=3
+# Give a consumer time to actually connect (browser device enumeration +
+# user clicking + open()) before the idle-stop logic can kick in at all.
+# Without this, the service was observed live being stopped ~7s after
+# starting — before any consumer ever got a chance to open it — because
+# nothing had opened it as a reader *yet*, not because nothing ever would.
+STARTUP_GRACE_SECONDS=20
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
@@ -39,6 +45,14 @@ has_external_holder() {
     return 1
 }
 
+seconds_since_start() {
+    local ts epoch_start
+    ts=$(systemctl --user show -p ActiveEnterTimestamp --value "$SERVICE" 2>/dev/null)
+    [ -z "$ts" ] && { echo 999999; return; }
+    epoch_start=$(date -d "$ts" +%s 2>/dev/null) || { echo 999999; return; }
+    echo $(( $(date +%s) - epoch_start ))
+}
+
 log "Camera watcher started, polling $DEVICE every ${POLL_INTERVAL}s"
 
 idle_polls=0
@@ -53,12 +67,22 @@ while true; do
             log "External holder detected on $DEVICE, starting $SERVICE"
             systemctl --user start "$SERVICE"
         fi
-    elif [ "$is_active" = "active" ]; then
-        idle_polls=$((idle_polls + 1))
-        if [ "$idle_polls" -ge "$STOP_AFTER_IDLE_POLLS" ]; then
-            log "No external holder for $((idle_polls * POLL_INTERVAL))s, stopping $SERVICE"
-            systemctl --user stop "$SERVICE"
-            idle_polls=0
-        fi
+        continue
+    fi
+
+    if [ "$is_active" != "active" ]; then
+        continue
+    fi
+
+    if [ "$(seconds_since_start)" -lt "$STARTUP_GRACE_SECONDS" ]; then
+        idle_polls=0
+        continue
+    fi
+
+    idle_polls=$((idle_polls + 1))
+    if [ "$idle_polls" -ge "$STOP_AFTER_IDLE_POLLS" ]; then
+        log "No external holder for $((idle_polls * POLL_INTERVAL))s, stopping $SERVICE"
+        systemctl --user stop "$SERVICE"
+        idle_polls=0
     fi
 done

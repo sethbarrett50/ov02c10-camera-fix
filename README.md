@@ -59,9 +59,16 @@ media-ctl -d /dev/media0 -p | grep -i ov02c10
 # 3. Test run in the foreground first (opens a preview window)
 make run
 
-# 4. Once it looks right, install as a systemd --user service for loopback mode
-make install
+# 4. For browser/Teams/Zoom use, feed the loopback device in the foreground
+make run-loopback
 ```
+
+`make run-loopback` is currently the supported way to use this as a
+webcam — leave it running in a terminal while you're on a call. There is
+also an on-demand systemd setup (`make install`, below) that tries to
+start/stop the pipeline automatically, but it **doesn't work with
+Chrome/Brave** — see the "Known issue" section in
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md) for why.
 
 `make setup` needs `sudo` for package installation and loading the
 `v4l2loopback` kernel module — it will prompt. It's idempotent, safe to
@@ -84,6 +91,11 @@ the loopback device — the camera light/pipeline turns on within a few
 seconds of opening Brave's camera picker (or similar) and turns off a few
 seconds after the last consumer closes it. `make logs`/`make logs-watcher`
 tail each service's journal if you want to watch this happen.
+
+**This doesn't currently work for browser cameras** (Chrome/Brave never
+lists the device in the first place, so nothing ever triggers the
+watcher) — see [`docs/DEBUGGING.md`](docs/DEBUGGING.md). Use
+`make run-loopback` instead for now.
 
 The `override.conf` caps the camera service at 1GB RAM / 1.5 CPU cores as
 a safety net — if a future regression leaks resources again, systemd
