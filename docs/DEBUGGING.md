@@ -65,7 +65,7 @@ IPU6-based laptops too).
   ```bash
   media-ctl -d /dev/media0 -p | grep -i ov02c10
   ```
-  `find_sensor_entity()` in `camera/main.py` does this automatically at
+  `find_sensor_entity()` in `camera/ov02c10_camera/media_pipeline.py` does this automatically at
   every startup instead of hardcoding a bus number.
 
 - **No exposure/gain control at all.** There's no AE/AGC loop anywhere in

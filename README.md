@@ -39,59 +39,77 @@ light. See [open issues](../../issues) for planned improvements.
   kernel modules loaded — check with `lsmod | grep ipu6`)
 - `v4l2loopback-dkms` (for the virtual camera device)
 - `gstreamer1.0-tools`, `gstreamer1.0-plugins-base`,
-  `python3-gi`, `gir1.2-gst-1.0` (GStreamer + Python bindings — installed
-  from your distro's package manager, not pip)
+  `python3-gi`, `gir1.2-gstreamer-1.0` (GStreamer + Python bindings —
+  installed from your distro's package manager, not pip)
 - `v4l-utils` (`media-ctl`, `v4l2-ctl`)
 - [`uv`](https://docs.astral.sh/uv/) for Python dependency management
 
-Run `make help` for shortcuts covering everything below (`make sync`,
-`make run`, `make install`, `make gain`, `make logs`, etc.).
+All of the above (except the kernel modules — see below) are installed
+automatically by `make setup` / `scripts/setup.sh`.
 
 ## Setup
 
 ```bash
-# 1. Load the v4l2loopback virtual camera device
-sudo modprobe v4l2loopback video_nr=48 card_label="OV02C10 Camera" exclusive_caps=1
+# 1. One-shot bootstrap: apt packages, v4l2loopback device, uv, Python deps
+make setup
 
-# 2. Install Python deps
-cd camera
-uv sync
-
-# 3. Confirm the sensor's current media entity name (bus number can change per boot)
+# 2. Confirm the sensor's current media entity name (bus number can change per boot)
 media-ctl -d /dev/media0 -p | grep -i ov02c10
 
-# 4. Test run in the foreground first (opens a preview window)
-uv run main.py
+# 3. Test run in the foreground first (opens a preview window)
+make run
 
-# 5. Once it looks right, install as a systemd --user service for loopback mode
-mkdir -p ~/code/ov02c10-camera-fix
-cp -r ../camera ~/code/ov02c10-camera-fix/
-mkdir -p ~/.config/systemd/user
-cp ../systemd/ov02c10-camera.service ~/.config/systemd/user/
-mkdir -p ~/.config/systemd/user/ov02c10-camera.service.d
-cp ../systemd/override.conf ~/.config/systemd/user/ov02c10-camera.service.d/
-systemctl --user daemon-reload
-systemctl --user enable --now ov02c10-camera
+# 4. Once it looks right, install as a systemd --user service for loopback mode
+make install
 ```
 
-The `override.conf` caps the service at 1GB RAM / 1.5 CPU cores as a
-safety net — if a future regression leaks resources again, systemd kills
-and restarts it instead of it taking down your machine.
+`make setup` needs `sudo` for package installation and loading the
+`v4l2loopback` kernel module — it will prompt. It's idempotent, safe to
+re-run.
+
+`make install` copies `camera/` to `~/code/ov02c10-camera-fix/camera`,
+syncs deps there, and installs the systemd unit + resource-cap override
+from `systemd/`. The `override.conf` caps the service at 1GB RAM / 1.5 CPU
+cores as a safety net — if a future regression leaks resources again,
+systemd kills and restarts it instead of it taking down your machine.
+
+Run `make help` to see every available command (`make test`, `make logs`,
+`make gain`, `make lint`, etc.).
+
+## Development
+
+```
+camera/
+  pyproject.toml
+  ov02c10_camera/
+    cli.py             # argument parsing, entry point
+    config.py          # CameraConfig dataclass
+    logging_setup.py   # logging configuration
+    media_pipeline.py  # media-ctl/v4l2-ctl wiring (sensor discovery, gain, links)
+    camera.py          # V4L2Camera: mmap capture + debayer
+    gst_pipeline.py     # GStreamer sink wiring (preview window or v4l2loopback)
+  tests/                # pytest — debayer math, pgAA unpacking, media-ctl parsing
+```
+
+`make test` runs the test suite (`camera/tests/`), which covers the
+hardware-independent logic (debayer math, pgAA unpacking, sensor-entity
+regex parsing against mocked `media-ctl` output) — it can't exercise the
+actual V4L2/GStreamer hardware path, which only real hardware can test.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Tuning for your environment
 
-Gain values in `camera/main.py`'s `CameraConfig` (`analogue_gain=150`,
-`digital_gain=4096`) were tuned for one indoor room and are not adaptive.
-If your image is too dark or too bright, check current sensor state and
-retune:
+Gain values in `CameraConfig` (`analogue_gain=150`, `digital_gain=4096`)
+were tuned for one indoor room and are not adaptive. If your image is too
+dark or too bright, check current sensor state and retune:
 
 ```bash
-v4l2-ctl -d "$(media-ctl -d /dev/media0 -e 'ov02c10 <BUS>-0036')" -l
-uv run main.py --analogue-gain 100 --digital-gain 2048   # example
+make gain   # prints current exposure/gain control values
+cd camera && uv run ov02c10-camera --analogue-gain 100 --digital-gain 2048   # example
 ```
 
-(`<BUS>` is whatever `media-ctl -p | grep ov02c10` reports for your boot —
-see [`docs/DEBUGGING.md`](docs/DEBUGGING.md).)
+See [`docs/DEBUGGING.md`](docs/DEBUGGING.md) for how the defaults were
+picked.
 
 ## License
 
