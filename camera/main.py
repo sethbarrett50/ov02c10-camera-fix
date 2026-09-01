@@ -629,10 +629,16 @@ def main() -> int:
     parser.add_argument('--no-setup', action='store_true', help='Skip media pipeline configuration')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug-level logging')
     parser.add_argument(
-        '--analogue-gain', type=int, default=150, help='Sensor analogue_gain control value, range 16-248 (default: 150)'
+        '--analogue-gain',
+        type=int,
+        default=150,
+        help='Sensor analogue_gain control value, range 16-248 (default: 150)',
     )
     parser.add_argument(
-        '--digital-gain', type=int, default=4096, help='Sensor digital_gain control value, range 1024-16383 (default: 4096)'
+        '--digital-gain',
+        type=int,
+        default=4096,
+        help='Sensor digital_gain control value, range 1024-16383 (default: 4096)',
     )
     args = parser.parse_args()
 
