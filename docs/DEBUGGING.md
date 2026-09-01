@@ -65,7 +65,7 @@ IPU6-based laptops too).
   ```bash
   media-ctl -d /dev/media0 -p | grep -i ov02c10
   ```
-  `find_sensor_entity()` in `camera/main.py` does this automatically at
+  `find_sensor_entity()` in `camera/ov02c10_camera/media_pipeline.py` does this automatically at
   every startup instead of hardcoding a bus number.
 
 - **No exposure/gain control at all.** There's no AE/AGC loop anywhere in
@@ -101,6 +101,118 @@ IPU6-based laptops too).
   `GstBuffer` 30 times a second; in practice it was never being reclaimed.
   Switched to `Gst.Buffer.new_allocate()` + `.fill()`, which allocates
   from GStreamer's own memory pool and copies into it instead.
+
+- **`free_device()` was killing the system's PipeWire multimedia service.**
+  Every `make run` broke live audio/mic routing (discovered mid-Teams-call).
+  The original implementation ran `fuser -k <device>` unconditionally to
+  clear the capture node before opening it — but `fuser` reported
+  `pipewire`/`wireplumber`'s PIDs as holding `/dev/video32` (WirePlumber
+  keeps a brief monitoring/enumeration handle on camera devices as part of
+  normal desktop media-session management, not an exclusive streaming
+  lock), and `fuser -k` killed them along with everything else, taking the
+  whole system's audio down with it. Fixed by checking each held-device
+  PID's process name via `ps -o comm=` first and never killing
+  `pipewire`/`wireplumber`/`pipewire-media-session` — only genuinely
+  conflicting processes get killed now.
+
+## Environment setup issues
+
+- **Debian's packaged `v4l2loopback-dkms` can fail to build on newer
+  kernels.** Trixie ships `v4l2loopback-dkms 0.15.0`, which fails against
+  kernel `6.17.13` with:
+  ```
+  error: implicit declaration of function 'setup_timer'
+  ```
+  `setup_timer()` was removed from the kernel timer API; upstream
+  `v4l2loopback` added a `#if defined(timer_setup)` compatibility branch
+  to handle this, but that fix landed after the `0.15.0` release Debian
+  packaged. Confirmed fixed as of upstream tag `v0.15.4`. `scripts/setup.sh`
+  builds that version from source via DKMS instead of relying on the apt
+  package, so it still auto-rebuilds on kernel upgrades like a normal DKMS
+  module.
+
+- **`ModuleNotFoundError: No module named 'gi'` when running via `uv run`/the
+  systemd service, even though `python3 -c "import gi"` works fine.**
+  PyGObject is installed via apt against the *system* Python
+  (`/usr/lib/python3/dist-packages`) — it's a C-extension GObject
+  Introspection binding, not something pip can build. `uv sync`/`uv venv`
+  by default download and manage their own standalone CPython build
+  (e.g. `~/.local/share/uv/python/cpython-3.14-...`), a completely
+  separate interpreter installation. Setting `include-system-site-packages
+  = true` in `pyvenv.cfg` doesn't help — it only adds *that interpreter's*
+  site-packages dir, and uv's standalone build has nothing installed via
+  apt. Fix: pin the venv to the actual system interpreter so
+  system-site-packages correctly points at the dist-packages `gi` is
+  actually in:
+  ```bash
+  uv venv --python /usr/bin/python3 --system-site-packages
+  uv sync --dev
+  ```
+  `Makefile`'s `sync`/`install` targets and `scripts/setup.sh` do this
+  automatically now — `uv sync` alone (without a pre-existing correctly
+  configured `.venv`) will silently create a venv that can't see `gi`.
+
+- **`/dev/video48` gets created root-only.** Manually `modprobe`-ing
+  `v4l2loopback` without the distro package's udev rule leaves the device
+  node as `crw------- root root` — neither a `systemd --user` service nor
+  a browser running as a regular user can open it. Fixed by installing a
+  udev rule (`GROUP="video", MODE="0660"`) and ensuring the user is in the
+  `video` group — both handled by `scripts/setup.sh`. Group membership
+  changes require logging out and back in to take effect.
+
+## Design decisions
+
+- **On-demand activation is polling-based, not inotify.** #10 asked for
+  the camera to only run while something has `/dev/video48` open, instead
+  of continuously from login. The natural first idea was an inotify watch
+  on the device node for open/close events — but our own service's
+  GStreamer `v4l2sink` also opens `/dev/video48` (as the producer), so a
+  raw inotify event stream can't cleanly distinguish "an external app
+  just opened it" from "the service we just started opened it as the
+  writer" without deeper per-fd tracking. `scripts/camera_watcher.sh`
+  polls `fuser /dev/video48` instead and excludes the service's own
+  `MainPID` (from `systemctl --user show -p MainPID`), which sidesteps
+  that ambiguity entirely at the cost of being bounded by a poll interval
+  (3s) rather than instant.
+
+## Known issue: on-demand activation (#10) doesn't work with Chrome/Brave
+
+`ov02c10-camera-watcher.service` was built to start the real camera
+pipeline only when something actually opens `/dev/video48`, instead of
+running it continuously from login (see Design decisions above). It
+doesn't work for browser use, and isn't fixable by tweaking the watcher —
+it's a structural conflict with how `v4l2loopback`'s `exclusive_caps=1`
+mode works:
+
+- With `exclusive_caps=1`, the device's reported V4L2 capability is *live*,
+  not persisted: it announces **OUTPUT-only** while no producer is
+  connected, and only switches to announcing **CAPTURE-only** — the mode
+  browsers filter on when enumerating cameras — while a producer is
+  actively holding it open. This is not a format that can be "primed" and
+  left; setting the format once via `v4l2-ctl --set-fmt-video-out` and
+  closing the fd immediately reverts the device to OUTPUT-only, confirmed
+  with `v4l2-ctl -d /dev/video48 --list-formats` returning empty again
+  right after.
+- Chrome/Brave's camera picker only lists devices currently reporting
+  CAPTURE capability, so with nothing producing, the device never appears
+  in the picker at all.
+- The watcher's activation trigger is "an external process has
+  `/dev/video48` open" (via polling `fuser`) — but a browser can't open a
+  device it can't see in its own picker. Nothing can ever trigger the
+  watcher from a cold start; it only works if something else already got
+  the device into CAPTURE mode first.
+
+Confirmed experimentally: running the pipeline continuously
+(`make run-loopback`, left running) shows up fine in Brave's picker.
+Relying on the watcher alone to start it on first open never shows up.
+
+**Current recommendation: don't use the on-demand watcher for browser use.**
+Run `make run-loopback` manually when you need the camera. The
+watcher/service code is left in the repo for reference — a real fix would
+need a always-on, low-cost placeholder producer that keeps the device in
+CAPTURE mode (e.g. a dummy blank-frame writer) and gets swapped for the
+real pipeline on demand, which is meaningfully more complex than the
+current polling design and hasn't been built.
 
 ## Useful diagnostic commands
 
