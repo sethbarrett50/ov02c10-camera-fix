@@ -6,10 +6,13 @@ RUFF  ?= ruff
 PY    ?= python
 CAM   := camera
 
-.PHONY: help sync lint format check test build clean preflight deps.check run install logs gain
+.PHONY: help setup sync lint format check test build clean preflight deps.check run install logs gain
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+
+setup: ## Bootstrap a fresh box: apt packages, v4l2loopback, uv, deps
+	./scripts/setup.sh
 
 sync: ## Install/sync deps (including dev group)
 	cd $(CAM) && $(UV) sync --dev
@@ -41,7 +44,7 @@ deps.check: ## Check for dependency issues
 	cd $(CAM) && $(UV) run deptry .
 
 run: ## Run camera preview in the foreground (Ctrl+C to stop)
-	cd $(CAM) && $(UV) run main.py
+	cd $(CAM) && $(UV) run ov02c10-camera
 
 install: ## Install as a systemd --user service (loopback mode, resource-capped)
 	mkdir -p ~/code/ov02c10-camera-fix

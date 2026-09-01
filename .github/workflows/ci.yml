@@ -35,7 +35,11 @@ jobs:
 
       - name: Byte-compile (syntax check)
         working-directory: camera
-        run: uv run python -m py_compile main.py
+        run: uv run python -m compileall ov02c10_camera -q
+
+      - name: Run tests
+        working-directory: camera
+        run: uv run pytest -q
 
       # gi/GStreamer come from apt (python3-gi), not the uv venv — PyGObject
       # needs libgirepository/cairo system libs to build from pip, so this
